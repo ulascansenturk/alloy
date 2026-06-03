@@ -59,8 +59,12 @@ type Component struct {
 	cleanupFuncs          []func()  // Cleanup functions for temp files
 
 	// OTLP receiver for traces and metrics (when Output is configured)
-	otlpReceiverAddr string       // Abstract UDS address for the OTLP receiver
-	otlpServer       *http.Server // HTTP server for OTLP receiver
+	otlpReceiverAddr string             // Abstract UDS address for the OTLP receiver
+	otlpServer       *http.Server       // HTTP server for OTLP receiver
+	otlpQueue        chan otlpItem      // Buffered hand-off from receiver handlers to workers
+	otlpWorkerCtx    context.Context    // Lifetime context for worker→consumer calls
+	otlpWorkerCancel context.CancelFunc // Cancels otlpWorkerCtx on receiver stop
+	otlpWorkersWG    sync.WaitGroup     // Tracks worker goroutines for clean shutdown
 
 	// Restart tracking
 	restartCount    int

@@ -17,6 +17,22 @@ import (
 	"github.com/grafana/alloy/internal/runtime/logging/level"
 )
 
+// Receiver handlers hand requests off to a bounded queue drained by a fixed worker
+// pool, so the slow downstream consume never blocks the accept path. This keeps
+// handlers fast, lets Beyla reuse its keep-alive connections, and turns sustained
+// backpressure into an explicit 503 instead of a UDS accept-backlog overflow.
+const (
+	otlpQueueCapacity = 256
+	otlpWorkers       = 4
+)
+
+// otlpItem is a request body handed from a receiver handler to a worker.
+type otlpItem struct {
+	isTraces    bool
+	body        []byte
+	contentType string
+}
+
 // startOTLPReceiver starts an HTTP server to receive OTLP traces and/or metrics from Beyla
 // and forwards them to the configured Output consumers. Listens on a Linux abstract Unix
 // socket so the Beyla↔Alloy hop avoids the TCP loopback path entirely (no conntrack,
@@ -34,6 +50,12 @@ func (c *Component) startOTLPReceiver() error {
 
 	c.mut.Lock()
 	c.otlpReceiverAddr = addr
+	c.otlpQueue = make(chan otlpItem, otlpQueueCapacity)
+	c.otlpWorkerCtx, c.otlpWorkerCancel = context.WithCancel(context.Background())
+	for i := 0; i < otlpWorkers; i++ {
+		c.otlpWorkersWG.Add(1)
+		go c.otlpWorker(c.otlpWorkerCtx, c.otlpQueue)
+	}
 	c.mut.Unlock()
 
 	level.Info(c.opts.Logger).Log("msg", "starting OTLP receiver", "addr", addr)
@@ -66,20 +88,42 @@ func (c *Component) startOTLPReceiver() error {
 func (c *Component) stopOTLPReceiver() {
 	c.mut.Lock()
 	server := c.otlpServer
+	queue := c.otlpQueue
+	cancel := c.otlpWorkerCancel
 	c.otlpServer = nil
+	c.otlpQueue = nil
+	c.otlpWorkerCancel = nil
 	c.mut.Unlock()
 
 	if server != nil {
 		level.Debug(c.opts.Logger).Log("msg", "stopping OTLP receiver")
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+		ctx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
 		if err := server.Shutdown(ctx); err != nil {
 			level.Warn(c.opts.Logger).Log("msg", "error shutting down OTLP receiver", "err", err)
 		}
 	}
+
+	// After Shutdown returns no handler is running, so no goroutine can still
+	// enqueue: it is safe to cancel in-flight consumes and close the queue.
+	if cancel != nil {
+		cancel()
+	}
+	if queue != nil {
+		close(queue)
+	}
+	c.otlpWorkersWG.Wait()
 }
 
 func (c *Component) handleOTLPMetrics(w http.ResponseWriter, r *http.Request) {
+	c.enqueueOTLP(w, r, false)
+}
+
+func (c *Component) handleOTLPTraces(w http.ResponseWriter, r *http.Request) {
+	c.enqueueOTLP(w, r, true)
+}
+
+func (c *Component) enqueueOTLP(w http.ResponseWriter, r *http.Request, isTraces bool) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -93,15 +137,49 @@ func (c *Component) handleOTLPMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
+	c.mut.Lock()
+	queue := c.otlpQueue
+	c.mut.Unlock()
+
+	if queue == nil {
+		http.Error(w, "receiver not running", http.StatusServiceUnavailable)
+		return
+	}
+
+	item := otlpItem{isTraces: isTraces, body: body, contentType: r.Header.Get("Content-Type")}
+	select {
+	case queue <- item:
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("{}"))
+	default:
+		// Sustained downstream backpressure; 503 is retryable and Beyla's OTLP exporter honours it.
+		level.Warn(c.opts.Logger).Log("msg", "OTLP receiver queue full, rejecting request", "is_traces", isTraces)
+		http.Error(w, "receiver overloaded", http.StatusServiceUnavailable)
+	}
+}
+
+func (c *Component) otlpWorker(ctx context.Context, queue <-chan otlpItem) {
+	defer c.otlpWorkersWG.Done()
+	for item := range queue {
+		if item.isTraces {
+			c.consumeTraces(ctx, item)
+		} else {
+			c.consumeMetrics(ctx, item)
+		}
+	}
+}
+
+func (c *Component) consumeMetrics(ctx context.Context, item otlpItem) {
 	req := pmetricotlp.NewExportRequest()
-	if strings.Contains(r.Header.Get("Content-Type"), "application/json") {
-		err = req.UnmarshalJSON(body)
+	var err error
+	if strings.Contains(item.contentType, "application/json") {
+		err = req.UnmarshalJSON(item.body)
 	} else {
-		err = req.UnmarshalProto(body)
+		err = req.UnmarshalProto(item.body)
 	}
 	if err != nil {
 		level.Error(c.opts.Logger).Log("msg", "failed to unmarshal OTLP metrics", "err", err)
-		http.Error(w, "failed to parse OTLP request", http.StatusBadRequest)
 		return
 	}
 
@@ -112,41 +190,23 @@ func (c *Component) handleOTLPMetrics(w http.ResponseWriter, r *http.Request) {
 	c.mut.Unlock()
 
 	for _, consumer := range consumers {
-		if err := consumer.ConsumeMetrics(r.Context(), metrics); err != nil {
+		if err := consumer.ConsumeMetrics(ctx, metrics); err != nil {
 			level.Error(c.opts.Logger).Log("msg", "failed to forward metrics to consumer", "err", err)
-			http.Error(w, "failed to process metrics", http.StatusInternalServerError)
 			return
 		}
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("{}"))
 }
 
-func (c *Component) handleOTLPTraces(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		level.Error(c.opts.Logger).Log("msg", "failed to read OTLP request body", "err", err)
-		http.Error(w, "failed to read request", http.StatusBadRequest)
-		return
-	}
-	defer r.Body.Close()
-
+func (c *Component) consumeTraces(ctx context.Context, item otlpItem) {
 	req := ptraceotlp.NewExportRequest()
-	if strings.Contains(r.Header.Get("Content-Type"), "application/json") {
-		err = req.UnmarshalJSON(body)
+	var err error
+	if strings.Contains(item.contentType, "application/json") {
+		err = req.UnmarshalJSON(item.body)
 	} else {
-		err = req.UnmarshalProto(body)
+		err = req.UnmarshalProto(item.body)
 	}
 	if err != nil {
 		level.Error(c.opts.Logger).Log("msg", "failed to unmarshal OTLP traces", "err", err)
-		http.Error(w, "failed to parse OTLP request", http.StatusBadRequest)
 		return
 	}
 
@@ -157,14 +217,9 @@ func (c *Component) handleOTLPTraces(w http.ResponseWriter, r *http.Request) {
 	c.mut.Unlock()
 
 	for _, consumer := range consumers {
-		if err := consumer.ConsumeTraces(r.Context(), traces); err != nil {
+		if err := consumer.ConsumeTraces(ctx, traces); err != nil {
 			level.Error(c.opts.Logger).Log("msg", "failed to forward traces to consumer", "err", err)
-			http.Error(w, "failed to process traces", http.StatusInternalServerError)
 			return
 		}
 	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte("{}"))
 }
