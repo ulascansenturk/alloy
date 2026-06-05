@@ -4,12 +4,10 @@ package beyla
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -18,10 +16,6 @@ import (
 
 	"github.com/grafana/alloy/internal/runtime/logging/level"
 )
-
-// TODO(diagnostic): temporary self-probe to catch transient connect:ECONNREFUSED
-// on the OTLP receiver's own socket. Remove once the UDS refusal is root-caused.
-const otlpSelfProbeInterval = 50 * time.Millisecond
 
 // Receiver handlers hand requests off to a bounded queue drained by a fixed worker
 // pool, so the slow downstream consume never blocks the accept path. This keeps
@@ -62,8 +56,6 @@ func (c *Component) startOTLPReceiver() error {
 		c.otlpWorkersWG.Add(1)
 		go c.otlpWorker(c.otlpWorkerCtx, c.otlpQueue)
 	}
-	c.otlpWorkersWG.Add(1)
-	go c.otlpSelfProbe(c.otlpWorkerCtx, addr)
 	c.mut.Unlock()
 
 	level.Info(c.opts.Logger).Log("msg", "starting OTLP receiver", "addr", addr)
@@ -230,70 +222,4 @@ func (c *Component) consumeTraces(ctx context.Context, item otlpItem) {
 			return
 		}
 	}
-}
-
-// otlpSelfProbe dials the receiver's own socket on a tight interval and logs any
-// connect failure together with the listener's /proc/net/unix line, to catch the
-// transient connect:ECONNREFUSED red-handed. Diagnostic only.
-func (c *Component) otlpSelfProbe(ctx context.Context, addr string) {
-	defer c.otlpWorkersWG.Done()
-
-	// Logged from inside the goroutine so it only appears if the probe truly started.
-	level.Info(c.opts.Logger).Log("msg", "OTLP self-probe started", "addr", addr, "interval", otlpSelfProbeInterval.String())
-
-	ticker := time.NewTicker(otlpSelfProbeInterval)
-	defer ticker.Stop()
-
-	heartbeat := time.NewTicker(5 * time.Minute)
-	defer heartbeat.Stop()
-
-	var dials, failures uint64
-	var d net.Dialer
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-heartbeat.C:
-			// Positive proof the probe is alive across the whole run; distinguishes
-			// "saw nothing" from "died" when reading logs after the fact.
-			level.Info(c.opts.Logger).Log("msg", "OTLP self-probe heartbeat", "dials", dials, "failures", failures)
-		case <-ticker.C:
-			dials++
-			conn, err := d.DialContext(ctx, "unix", addr)
-			if err != nil {
-				if errors.Is(err, context.Canceled) {
-					return
-				}
-				failures++
-				level.Warn(c.opts.Logger).Log(
-					"msg", "OTLP self-probe dial failed",
-					"addr", addr,
-					"err", err,
-					"proc_net_unix", procNetUnixFor(addr),
-				)
-				continue
-			}
-			_ = conn.Close()
-		}
-	}
-}
-
-// procNetUnixFor returns the /proc/net/unix lines mentioning addr (the listener and
-// any live connections), so a probe failure captures the socket's kernel-visible state.
-func procNetUnixFor(addr string) string {
-	name := strings.TrimPrefix(addr, "@")
-	data, err := os.ReadFile("/proc/net/unix")
-	if err != nil {
-		return fmt.Sprintf("read error: %v", err)
-	}
-	var matched []string
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.Contains(line, name) {
-			matched = append(matched, strings.TrimSpace(line))
-		}
-	}
-	if len(matched) == 0 {
-		return "no matching socket"
-	}
-	return strings.Join(matched, " | ")
 }
