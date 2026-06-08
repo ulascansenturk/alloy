@@ -11,4 +11,3 @@ import (
 //
 //go:embed beyla_binary_amd64
 var beylaEmbeddedBinary []byte
-

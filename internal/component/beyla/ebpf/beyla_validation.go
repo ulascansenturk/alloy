@@ -17,6 +17,15 @@ func isValidInstrumentation(instrumentation string) bool {
 	}
 }
 
+const (
+	SamplerAlwaysOn                = "always_on"
+	SamplerAlwaysOff               = "always_off"
+	SamplerTraceIDRatio            = "traceidratio"
+	SamplerParentBasedAlwaysOn     = "parentbased_always_on"
+	SamplerParentBasedAlwaysOff    = "parentbased_always_off"
+	SamplerParentBasedTraceIDRatio = "parentbased_traceidratio"
+)
+
 // Validate validates the SamplerConfig
 func (args SamplerConfig) Validate() error {
 	if args.Name == "" {

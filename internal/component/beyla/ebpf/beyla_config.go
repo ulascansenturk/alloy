@@ -76,12 +76,8 @@ func (c *Component) buildConfig() map[string]interface{} {
 }
 
 func (c *Component) addPrometheusConfig(config map[string]interface{}) {
-	c.mut.Lock()
-	port := c.subprocessPort
-	c.mut.Unlock()
-
 	prometheus := map[string]interface{}{
-		"port": port,
+		"port": c.subprocess.Port(),
 	}
 
 	c.fillPrometheusExportConfig(prometheus)
@@ -90,9 +86,7 @@ func (c *Component) addPrometheusConfig(config map[string]interface{}) {
 }
 
 func (c *Component) addHealthCheckConfig(config map[string]interface{}) {
-	c.mut.Lock()
-	addr := c.subprocessHealthAddr
-	c.mut.Unlock()
+	addr := c.subprocess.HealthAddr()
 
 	if addr == "" {
 		return
@@ -114,12 +108,8 @@ func (c *Component) addInternalMetricsConfig(config map[string]interface{}) {
 	}
 
 	if c.args.InternalMetrics.Exporter == "prometheus" {
-		c.mut.Lock()
-		port := c.subprocessPort
-		c.mut.Unlock()
-
 		m["prometheus"] = map[string]interface{}{
-			"port": port,
+			"port": c.subprocess.Port(),
 			"path": "/metrics",
 		}
 	}
@@ -293,10 +283,7 @@ func (c *Component) addOTLPTracesExportConfig(config map[string]interface{}) {
 		return
 	}
 
-	c.mut.Lock()
 	addr := c.otlpReceiverAddr
-	c.mut.Unlock()
-
 	if addr == "" {
 		return
 	}
@@ -314,10 +301,7 @@ func (c *Component) addOTLPMetricsExportConfig(config map[string]interface{}) {
 		return
 	}
 
-	c.mut.Lock()
 	addr := c.otlpReceiverAddr
-	c.mut.Unlock()
-
 	if addr == "" {
 		return
 	}

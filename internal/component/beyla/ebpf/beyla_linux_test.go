@@ -4,10 +4,7 @@ package beyla
 
 import (
 	"bytes"
-	"context"
 	"os"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +14,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/grafana/alloy/internal/component"
+	"github.com/grafana/alloy/internal/component/beyla/ebpf/internal/subprocess"
 	"github.com/grafana/alloy/internal/component/otelcol"
 	"github.com/grafana/alloy/syntax"
 )
@@ -253,10 +251,11 @@ func TestYAMLGeneration(t *testing.T) {
 	}
 
 	comp := &Component{
-		opts:           opts,
-		args:           args,
-		subprocessPort: 12345,
+		opts:       opts,
+		args:       args,
+		subprocess: subprocess.New(),
 	}
+	comp.subprocess.SetListen(12345, "")
 
 	configPath, cleanup, err := comp.writeConfigFile()
 	require.NoError(t, err)
@@ -330,7 +329,8 @@ func TestYAMLGeneration_NewSchemaFields(t *testing.T) {
 		Metrics: Metrics{Features: []string{"network"}},
 	}
 
-	comp := &Component{opts: opts, args: args, subprocessPort: 9090}
+	comp := &Component{opts: opts, args: args, subprocess: subprocess.New()}
+	comp.subprocess.SetListen(9090, "")
 	configPath, cleanup, err := comp.writeConfigFile()
 	require.NoError(t, err)
 	defer cleanup()
@@ -391,10 +391,11 @@ func TestYAMLGeneration_NetworkFlows(t *testing.T) {
 	}
 
 	comp := &Component{
-		opts:           opts,
-		args:           args,
-		subprocessPort: 12345,
+		opts:       opts,
+		args:       args,
+		subprocess: subprocess.New(),
 	}
+	comp.subprocess.SetListen(12345, "")
 
 	configPath, cleanup, err := comp.writeConfigFile()
 	require.NoError(t, err)
@@ -987,16 +988,7 @@ func TestArguments_Validate_TracesOutputRequired(t *testing.T) {
 
 func TestDeprecatedFields(t *testing.T) {
 	var buf bytes.Buffer
-	var mu sync.Mutex
-
-	// Create a synchronized logger that protects both writing and reading
-	syncLogger := log.LoggerFunc(func(keyvals ...interface{}) error {
-		mu.Lock()
-		defer mu.Unlock()
-		return log.NewLogfmtLogger(&buf).Log(keyvals...)
-	})
-
-	logger := level.NewFilter(syncLogger, level.AllowAll())
+	logger := level.NewFilter(log.NewLogfmtLogger(&buf), level.AllowAll())
 
 	comp := &Component{
 		opts: component.Options{
@@ -1011,19 +1003,10 @@ func TestDeprecatedFields(t *testing.T) {
 		},
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	comp.logDeprecationWarnings()
 
-	// Start component which should trigger warnings
-	go comp.Run(ctx)
-
-	// Verify warnings were logged
-	require.Eventually(t, func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		output := buf.String()
-		return strings.Contains(output, "level=warn") &&
-			strings.Contains(output, "open_port' field is deprecated") &&
-			strings.Contains(output, "executable_name' field is deprecated")
-	}, time.Second, time.Millisecond*10)
+	output := buf.String()
+	require.Contains(t, output, "level=warn")
+	require.Contains(t, output, "open_port' field is deprecated")
+	require.Contains(t, output, "executable_name' field is deprecated")
 }

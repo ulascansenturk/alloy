@@ -14,6 +14,7 @@ import (
 	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
 	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
 
+	"github.com/grafana/alloy/internal/component/otelcol"
 	"github.com/grafana/alloy/internal/runtime/logging/level"
 )
 
@@ -37,8 +38,12 @@ type otlpItem struct {
 // and forwards them to the configured Output consumers. Listens on a Linux abstract Unix
 // socket so the Beyla↔Alloy hop avoids the TCP loopback path entirely (no conntrack,
 // no ephemeral port churn).
+//
+// The receiver runs entirely on the Run goroutine (start/stop), and the workers and
+// handlers capture the queue and output consumers, so the otlp* fields need no locking.
 func (c *Component) startOTLPReceiver() error {
-	if c.args.Output == nil || (len(c.args.Output.Traces) == 0 && len(c.args.Output.Metrics) == 0) {
+	output := c.args.Output
+	if output == nil || (len(output.Traces) == 0 && len(output.Metrics) == 0) {
 		return nil
 	}
 
@@ -48,33 +53,33 @@ func (c *Component) startOTLPReceiver() error {
 		return fmt.Errorf("failed to listen on OTLP receiver UDS %q: %w", addr, err)
 	}
 
-	c.mut.Lock()
-	c.otlpReceiverAddr = addr
-	c.otlpQueue = make(chan otlpItem, otlpQueueCapacity)
-	c.otlpWorkerCtx, c.otlpWorkerCancel = context.WithCancel(context.Background())
+	queue := make(chan otlpItem, otlpQueueCapacity)
+	workerCtx, workerCancel := context.WithCancel(context.Background())
 	for i := 0; i < otlpWorkers; i++ {
 		c.otlpWorkersWG.Add(1)
-		go c.otlpWorker(c.otlpWorkerCtx, c.otlpQueue)
+		go c.otlpWorker(workerCtx, queue, output)
 	}
-	c.mut.Unlock()
 
 	level.Info(c.opts.Logger).Log("msg", "starting OTLP receiver", "addr", addr)
 
 	mux := http.NewServeMux()
-	if len(c.args.Output.Traces) > 0 {
-		mux.HandleFunc("/v1/traces", c.handleOTLPTraces)
+	if len(output.Traces) > 0 {
+		mux.HandleFunc("/v1/traces", func(w http.ResponseWriter, r *http.Request) {
+			c.enqueueOTLP(w, r, queue, true)
+		})
 	}
-	if len(c.args.Output.Metrics) > 0 {
-		mux.HandleFunc("/v1/metrics", c.handleOTLPMetrics)
+	if len(output.Metrics) > 0 {
+		mux.HandleFunc("/v1/metrics", func(w http.ResponseWriter, r *http.Request) {
+			c.enqueueOTLP(w, r, queue, false)
+		})
 	}
 
-	server := &http.Server{
-		Handler: mux,
-	}
+	server := &http.Server{Handler: mux}
 
-	c.mut.Lock()
+	c.otlpReceiverAddr = addr
+	c.otlpQueue = queue
+	c.otlpWorkerCancel = workerCancel
 	c.otlpServer = server
-	c.mut.Unlock()
 
 	go func() {
 		if err := server.Serve(lis); err != nil && err != http.ErrServerClosed {
@@ -86,14 +91,13 @@ func (c *Component) startOTLPReceiver() error {
 }
 
 func (c *Component) stopOTLPReceiver() {
-	c.mut.Lock()
 	server := c.otlpServer
 	queue := c.otlpQueue
 	cancel := c.otlpWorkerCancel
+
 	c.otlpServer = nil
 	c.otlpQueue = nil
 	c.otlpWorkerCancel = nil
-	c.mut.Unlock()
 
 	if server != nil {
 		level.Debug(c.opts.Logger).Log("msg", "stopping OTLP receiver")
@@ -115,15 +119,7 @@ func (c *Component) stopOTLPReceiver() {
 	c.otlpWorkersWG.Wait()
 }
 
-func (c *Component) handleOTLPMetrics(w http.ResponseWriter, r *http.Request) {
-	c.enqueueOTLP(w, r, false)
-}
-
-func (c *Component) handleOTLPTraces(w http.ResponseWriter, r *http.Request) {
-	c.enqueueOTLP(w, r, true)
-}
-
-func (c *Component) enqueueOTLP(w http.ResponseWriter, r *http.Request, isTraces bool) {
+func (c *Component) enqueueOTLP(w http.ResponseWriter, r *http.Request, queue chan otlpItem, isTraces bool) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -136,15 +132,6 @@ func (c *Component) enqueueOTLP(w http.ResponseWriter, r *http.Request, isTraces
 		return
 	}
 	defer r.Body.Close()
-
-	c.mut.Lock()
-	queue := c.otlpQueue
-	c.mut.Unlock()
-
-	if queue == nil {
-		http.Error(w, "receiver not running", http.StatusServiceUnavailable)
-		return
-	}
 
 	item := otlpItem{isTraces: isTraces, body: body, contentType: r.Header.Get("Content-Type")}
 	select {
@@ -159,18 +146,18 @@ func (c *Component) enqueueOTLP(w http.ResponseWriter, r *http.Request, isTraces
 	}
 }
 
-func (c *Component) otlpWorker(ctx context.Context, queue <-chan otlpItem) {
+func (c *Component) otlpWorker(ctx context.Context, queue <-chan otlpItem, output *otelcol.ConsumerArguments) {
 	defer c.otlpWorkersWG.Done()
 	for item := range queue {
 		if item.isTraces {
-			c.consumeTraces(ctx, item)
+			c.consumeTraces(ctx, item, output.Traces)
 		} else {
-			c.consumeMetrics(ctx, item)
+			c.consumeMetrics(ctx, item, output.Metrics)
 		}
 	}
 }
 
-func (c *Component) consumeMetrics(ctx context.Context, item otlpItem) {
+func (c *Component) consumeMetrics(ctx context.Context, item otlpItem, consumers []otelcol.Consumer) {
 	req := pmetricotlp.NewExportRequest()
 	var err error
 	if strings.Contains(item.contentType, "application/json") {
@@ -184,11 +171,6 @@ func (c *Component) consumeMetrics(ctx context.Context, item otlpItem) {
 	}
 
 	metrics := req.Metrics()
-
-	c.mut.Lock()
-	consumers := c.args.Output.Metrics
-	c.mut.Unlock()
-
 	for _, consumer := range consumers {
 		if err := consumer.ConsumeMetrics(ctx, metrics); err != nil {
 			level.Error(c.opts.Logger).Log("msg", "failed to forward metrics to consumer", "err", err)
@@ -197,7 +179,7 @@ func (c *Component) consumeMetrics(ctx context.Context, item otlpItem) {
 	}
 }
 
-func (c *Component) consumeTraces(ctx context.Context, item otlpItem) {
+func (c *Component) consumeTraces(ctx context.Context, item otlpItem, consumers []otelcol.Consumer) {
 	req := ptraceotlp.NewExportRequest()
 	var err error
 	if strings.Contains(item.contentType, "application/json") {
@@ -211,11 +193,6 @@ func (c *Component) consumeTraces(ctx context.Context, item otlpItem) {
 	}
 
 	traces := req.Traces()
-
-	c.mut.Lock()
-	consumers := c.args.Output.Traces
-	c.mut.Unlock()
-
 	for _, consumer := range consumers {
 		if err := consumer.ConsumeTraces(ctx, traces); err != nil {
 			level.Error(c.opts.Logger).Log("msg", "failed to forward traces to consumer", "err", err)

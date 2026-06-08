@@ -10,7 +10,6 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"os/exec"
 	"path"
 	"strings"
 	"sync"
@@ -22,6 +21,8 @@ import (
 	"golang.org/x/sync/errgroup" //nolint:depguard
 
 	"github.com/grafana/alloy/internal/component"
+	"github.com/grafana/alloy/internal/component/beyla/ebpf/internal/health"
+	"github.com/grafana/alloy/internal/component/beyla/ebpf/internal/subprocess"
 	"github.com/grafana/alloy/internal/component/discovery"
 	"github.com/grafana/alloy/internal/featuregate"
 	"github.com/grafana/alloy/internal/runtime/logging/level"
@@ -42,212 +43,261 @@ func init() {
 }
 
 type Component struct {
-	opts       component.Options
-	mut        sync.Mutex
-	args       Arguments
+	opts component.Options
+
 	argsUpdate chan Arguments
 
-	// Subprocess-specific fields
-	subprocessPort        int       // Port where Beyla subprocess listens
-	subprocessAddr        string    // Full address (http://localhost:PORT)
-	subprocessProfilePort int       // Beyla pprof port; 0 when pprof is disabled in Alloy
-	subprocessHealthAddr  string    // Abstract UDS address for Beyla's /healthz
-	subprocessCmd         *exec.Cmd // The running subprocess
-	beylaExePath          string    // Path to extracted Beyla binary
-	beylaExeClose         func()    // Closes the memfd; called early after exec, cleanup is fallback
-	configPath            string    // Path to config file
-	cleanupFuncs          []func()  // Cleanup functions for temp files
+	// only the Run goroutine touches these, so they need no synchronisation.
+	args             Arguments
+	subprocessCancel context.CancelFunc
+	subprocessGroup  *errgroup.Group
+	restartTimer     *time.Timer
+	otlpReceiverAddr string
+	otlpServer       *http.Server
+	otlpQueue        chan otlpItem
+	otlpWorkerCancel context.CancelFunc
+	otlpWorkersWG    sync.WaitGroup
 
-	// OTLP receiver for traces and metrics (when Output is configured)
-	otlpReceiverAddr string             // Abstract UDS address for the OTLP receiver
-	otlpServer       *http.Server       // HTTP server for OTLP receiver
-	otlpQueue        chan otlpItem      // Buffered hand-off from receiver handlers to workers
-	otlpWorkerCtx    context.Context    // Lifetime context for worker→consumer calls
-	otlpWorkerCancel context.CancelFunc // Cancels otlpWorkerCtx on receiver stop
-	otlpWorkersWG    sync.WaitGroup     // Tracks worker goroutines for clean shutdown
-
-	// Restart tracking
-	restartCount    int
-	lastRestartTime time.Time
-	restartBackoff  time.Duration
-	subprocessReady bool // true after first successful health check
-
-	healthMut sync.RWMutex
-	health    component.Health
+	subprocess *subprocess.Handle
+	health     *health.Reporter
 }
 
 var _ component.HealthComponent = (*Component)(nil)
-
-const (
-	SamplerAlwaysOn                = "always_on"
-	SamplerAlwaysOff               = "always_off"
-	SamplerTraceIDRatio            = "traceidratio"
-	SamplerParentBasedAlwaysOn     = "parentbased_always_on"
-	SamplerParentBasedAlwaysOff    = "parentbased_always_off"
-	SamplerParentBasedTraceIDRatio = "parentbased_traceidratio"
-)
 
 func New(opts component.Options, args Arguments) (*Component, error) {
 	c := &Component{
 		opts:       opts,
 		args:       args,
 		argsUpdate: make(chan Arguments, 1),
+		subprocess: subprocess.New(),
+		health:     health.New(),
 	}
 
 	if err := c.registerMetrics(opts.Registerer); err != nil {
 		return nil, err
 	}
 
-	if err := c.Update(args); err != nil {
+	if err := c.publishExports(); err != nil {
 		return nil, err
 	}
+
 	return c, nil
+}
+
+func (c *Component) Run(ctx context.Context) error {
+	c.logDeprecationWarnings()
+
+	c.restartTimer = time.NewTimer(0)
+	defer c.restartTimer.Stop()
+
+	for {
+		if c.applyPendingArgsUpdate() {
+			continue
+		}
+
+		select {
+		case <-ctx.Done():
+			c.stopSubprocess()
+			return nil
+
+		case newArgs := <-c.argsUpdate:
+			c.handleArgsUpdate(newArgs)
+
+		case <-c.restartTimer.C:
+			c.handleSubprocessStart(ctx)
+		}
+	}
+}
+
+func (c *Component) Update(args component.Arguments) error {
+	if err := c.publishExports(); err != nil {
+		return err
+	}
+
+	c.argsUpdate <- args.(Arguments)
+
+	return nil
+}
+
+func (c *Component) CurrentHealth() component.Health {
+	return c.health.Current()
+}
+
+func (c *Component) Handler() http.Handler {
+	return http.HandlerFunc(c.serveHTTP)
+}
+
+// serveHTTP reverse-proxies a request to the Beyla subprocess, routing /debug/pprof
+// to the pprof port when enabled and the rest to the main subprocess port.
+func (c *Component) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	addr, profilePort, ready := c.subprocess.ProxyTarget()
+
+	if addr == "" {
+		http.Error(w, "Beyla subprocess not started", http.StatusServiceUnavailable)
+		return
+	}
+
+	targetAddr, ok := resolveTargetAddr(addr, profilePort, r.URL.Path)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	target, err := url.Parse(targetAddr)
+	if err != nil {
+		level.Error(c.opts.Logger).Log("msg", "failed to parse subprocess URL", "err", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	proxy := httputil.NewSingleHostReverseProxy(target)
+
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		if errors.Is(err, context.Canceled) {
+			// Client disconnected or Alloy is shutting down
+			level.Debug(c.opts.Logger).Log("msg", "proxy request cancelled", "err", err)
+			return
+		}
+		if ready {
+			level.Error(c.opts.Logger).Log("msg", "proxy error", "err", err)
+			http.Error(w, "subprocess unavailable", http.StatusBadGateway)
+		} else {
+			level.Debug(c.opts.Logger).Log("msg", "proxy error (subprocess initializing)", "err", err)
+			// Return empty 200 so scrapers don't log warnings during startup.
+			w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+			w.WriteHeader(http.StatusOK)
+		}
+	}
+
+	proxy.ServeHTTP(w, r)
+}
+
+func resolveTargetAddr(addr string, profilePort int, path string) (targetAddr string, ok bool) {
+	if strings.HasPrefix(path, "/debug/pprof") {
+		if profilePort == 0 {
+			return "", false
+		}
+		return fmt.Sprintf("http://127.0.0.1:%d", profilePort), true
+	}
+
+	return addr, true
+}
+
+func (c *Component) publishExports() error {
+	baseTarget, err := c.baseTarget()
+
+	if err != nil {
+		return err
+	}
+
+	c.opts.OnStateChange(Exports{
+		Targets: []discovery.Target{baseTarget},
+	})
+
+	return nil
+}
+
+func (c *Component) applyPendingArgsUpdate() bool {
+	select {
+	case newArgs := <-c.argsUpdate:
+		c.handleArgsUpdate(newArgs)
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *Component) registerMetrics(reg prometheus.Registerer) error {
 	subReg := prometheus.WrapRegistererWith(prometheus.Labels{"subprocess": "beyla"}, reg)
-	return subReg.Register(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{
-		PidFn: func() (int, error) {
-			c.mut.Lock()
-			cmd := c.subprocessCmd
-			c.mut.Unlock()
-			if cmd == nil || cmd.Process == nil {
-				return 0, fmt.Errorf("subprocess not running")
-			}
-			return cmd.Process.Pid, nil
-		},
+
+	opts := collectors.ProcessCollectorOpts{
+		PidFn:        c.subprocessPid,
 		Namespace:    "alloy_resources",
 		ReportErrors: false,
-	}))
+	}
+
+	return subReg.Register(collectors.NewProcessCollector(opts))
+}
+
+func (c *Component) subprocessPid() (int, error) {
+	if pid, ok := c.subprocess.Pid(); ok {
+		return pid, nil
+	}
+
+	return 0, fmt.Errorf("subprocess not running")
 }
 
 func (c *Component) logDeprecationWarnings() {
 	if c.args.Port != "" {
 		level.Warn(c.opts.Logger).Log("msg", "The 'open_port' field is deprecated. Use 'discovery.services' instead.")
 	}
+
 	if c.args.ExecutableName != "" {
 		level.Warn(c.opts.Logger).Log("msg", "The 'executable_name' field is deprecated. Use 'discovery.services' instead.")
 	}
+
 	if c.args.Debug {
 		level.Warn(c.opts.Logger).Log("msg", "The 'debug' field is deprecated. Use 'log_level = \"debug\"' instead.")
 	}
+
 	if len(c.args.Discovery.Services) > 0 {
 		level.Warn(c.opts.Logger).Log("msg", "discovery.services is deprecated, use discovery.instrument instead")
 	}
+
 	if len(c.args.Discovery.ExcludeServices) > 0 {
 		level.Warn(c.opts.Logger).Log("msg", "discovery.exclude_services is deprecated, use discovery.exclude_instrument instead")
 	}
+
 	if len(c.args.Discovery.DefaultExcludeServices) > 0 {
 		level.Warn(c.opts.Logger).Log("msg", "discovery.default_exclude_services is deprecated, use discovery.default_exclude_instrument instead")
 	}
 }
 
-func (c *Component) drainPendingArgsUpdates() {
-	select {
-	case latestArgs := <-c.argsUpdate:
-		latestArgs = getLatestArgsFromChannel(c.argsUpdate, latestArgs)
-		c.mut.Lock()
-		c.args = latestArgs
-		c.mut.Unlock()
-	default:
-	}
+func (c *Component) handleArgsUpdate(newArgs Arguments) {
+	c.args = getLatestArgsFromChannel(c.argsUpdate, newArgs)
+
+	c.stopSubprocess()
+
+	c.subprocess.ResetRestartTracking()
+	c.restartTimer.Reset(0)
 }
 
-// Run implements component.Component.
-func (c *Component) Run(ctx context.Context) error {
-	c.logDeprecationWarnings()
-
-	c.mut.Lock()
-	c.restartBackoff = 1 * time.Second
-	c.mut.Unlock()
-
-	c.drainPendingArgsUpdates()
-
-	var cancel context.CancelFunc
-	var cancelG *errgroup.Group
-	restartTimer := time.NewTimer(0)
-	defer restartTimer.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			if cancel != nil {
-				cancel()
-			}
-			return nil
-
-		case newArgs := <-c.argsUpdate:
-			c.handleArgsUpdate(newArgs, cancel, cancelG, restartTimer)
-
-		case <-restartTimer.C:
-			var err error
-			cancel, cancelG, err = c.handleSubprocessStart(ctx, cancel, cancelG, restartTimer)
-			if err != nil {
-				continue
-			}
-		}
-	}
-}
-
-const maxRestartCount = 10
-
-func (c *Component) scheduleRestart(timer *time.Timer) {
-	c.mut.Lock()
-	defer c.mut.Unlock()
-
-	if c.restartCount >= maxRestartCount {
-		level.Error(c.opts.Logger).Log("msg", "Beyla subprocess exceeded maximum restart attempts, giving up", "max_restarts", maxRestartCount)
+// stopSubprocess cancels the running subprocess (if any) and waits for its
+// goroutines to exit before cleaning up. Crash-driven unhealthy reporting is
+// handled by the subprocess monitor in handleSubprocessStart, not here.
+func (c *Component) stopSubprocess() {
+	if c.subprocessCancel == nil {
 		return
 	}
 
-	backoff := c.restartBackoff
-	c.restartBackoff = c.restartBackoff * 2
-	if c.restartBackoff > 30*time.Second {
-		c.restartBackoff = 30 * time.Second
+	c.subprocessCancel()
+	level.Info(c.opts.Logger).Log("msg", "waiting for Beyla subprocess to terminate")
+
+	if err := c.subprocessGroup.Wait(); err != nil {
+		level.Error(c.opts.Logger).Log("msg", "Beyla subprocess terminated with error", "err", err)
 	}
 
-	level.Info(c.opts.Logger).Log("msg", "scheduling subprocess restart", "backoff", backoff, "restart_count", c.restartCount)
-	timer.Reset(backoff)
+	c.cleanup()
+
+	c.subprocessCancel = nil
+	c.subprocessGroup = nil
 }
 
-func (c *Component) handleArgsUpdate(newArgs Arguments, cancel context.CancelFunc, cancelG *errgroup.Group, restartTimer *time.Timer) {
-	newArgs = getLatestArgsFromChannel(c.argsUpdate, newArgs)
-	c.args = newArgs
-
-	if cancel != nil {
-		cancel()
-		level.Info(c.opts.Logger).Log("msg", "waiting for Beyla subprocess to terminate")
-		if err := cancelG.Wait(); err != nil {
-			level.Error(c.opts.Logger).Log("msg", "Beyla subprocess terminated with error", "err", err)
-			c.reportUnhealthy(err)
+func getLatestArgsFromChannel[A any](ch chan A, current A) A {
+	for {
+		select {
+		case x := <-ch:
+			current = x
+		default:
+			return current
 		}
-		c.cleanup()
 	}
-
-	// Reset restart tracking on config change.
-	c.mut.Lock()
-	c.restartCount = 0
-	c.restartBackoff = 1 * time.Second
-	c.mut.Unlock()
-
-	restartTimer.Reset(0)
 }
 
-func (c *Component) handleSubprocessStart(ctx context.Context, cancel context.CancelFunc, cancelG *errgroup.Group, restartTimer *time.Timer) (context.CancelFunc, *errgroup.Group, error) {
-	if cancel != nil {
-		cancel()
-		level.Info(c.opts.Logger).Log("msg", "waiting for Beyla subprocess to terminate before restart")
-		if err := cancelG.Wait(); err != nil {
-			level.Error(c.opts.Logger).Log("msg", "Beyla subprocess terminated with error", "err", err)
-		}
-		c.cleanup()
-	}
+func (c *Component) handleSubprocessStart(ctx context.Context) {
+	c.stopSubprocess()
 
-	c.mut.Lock()
-	restartCount := c.restartCount
-	c.restartCount++
-	c.lastRestartTime = time.Now()
-	c.mut.Unlock()
+	restartCount := c.subprocess.RecordStart()
 
 	if restartCount > 0 {
 		level.Info(c.opts.Logger).Log("msg", "restarting Beyla subprocess", "restart_count", restartCount)
@@ -257,89 +307,83 @@ func (c *Component) handleSubprocessStart(ctx context.Context, cancel context.Ca
 
 	newCtx, cancelFunc := context.WithCancel(ctx)
 
-	if err := c.setupSubprocess(restartTimer); err != nil {
+	if err := c.setupSubprocess(); err != nil {
 		cancelFunc()
-		return cancel, cancelG, err
+		return
 	}
 
 	g, launchCtx := errgroup.WithContext(newCtx)
 	g.Go(func() error { return c.runSubprocess(launchCtx) })
-	g.Go(func() error { return c.healthCheckLoop(launchCtx) })
+	g.Go(func() error { return c.watchdogLoop(launchCtx) })
 
-	// Monitor subprocess in background; schedule restart on unexpected exit.
-	go func() {
-		err := g.Wait()
-		if ctx.Err() == nil && err != nil {
-			level.Error(c.opts.Logger).Log("msg", "Beyla subprocess crashed, scheduling restart", "err", err)
-			c.reportUnhealthy(err)
-			c.scheduleRestart(restartTimer)
-		}
-	}()
+	go c.monitorSubprocess(ctx, g)
 
-	return cancelFunc, g, nil
+	c.subprocessCancel = cancelFunc
+	c.subprocessGroup = g
 }
 
-func (c *Component) setupSubprocess(restartTimer *time.Timer) error {
+// monitorSubprocess waits for the subprocess goroutines to exit and schedules a
+// restart if they failed for a reason other than the parent context being cancelled
+// (i.e. a crash, not an intentional stop).
+func (c *Component) monitorSubprocess(ctx context.Context, g *errgroup.Group) {
+	err := g.Wait()
+	if ctx.Err() == nil && err != nil {
+		level.Error(c.opts.Logger).Log("msg", "Beyla subprocess crashed, scheduling restart", "err", err)
+		c.health.SetUnhealthy(err)
+		c.scheduleRestart()
+	}
+}
+
+func (c *Component) setupSubprocess() error {
 	exePath, cleanupBinary, err := c.extractBeylaExecutable()
 	if err != nil {
 		level.Error(c.opts.Logger).Log("msg", "failed to extract Beyla binary", "err", err)
-		c.reportUnhealthy(err)
-		c.scheduleRestart(restartTimer)
+		c.health.SetUnhealthy(err)
+		c.scheduleRestart()
 		return err
 	}
 
-	c.mut.Lock()
-	c.beylaExePath = exePath
-	c.beylaExeClose = cleanupBinary
-	c.mut.Unlock()
+	c.subprocess.SetBinary(exePath, cleanupBinary)
 
 	if err := c.startOTLPReceiver(); err != nil {
 		level.Error(c.opts.Logger).Log("msg", "failed to start OTLP receiver", "err", err)
-		c.reportUnhealthy(err)
+		c.health.SetUnhealthy(err)
 		c.cleanup()
-		c.scheduleRestart(restartTimer)
+		c.scheduleRestart()
 		return err
 	}
 
 	port, err := findFreePort()
 	if err != nil {
 		level.Error(c.opts.Logger).Log("msg", "failed to allocate port", "err", err)
-		c.reportUnhealthy(err)
+		c.health.SetUnhealthy(err)
 		c.cleanup()
-		c.scheduleRestart(restartTimer)
+		c.scheduleRestart()
 		return err
 	}
 
-	c.mut.Lock()
-	c.subprocessPort = port
-	c.subprocessAddr = fmt.Sprintf("http://127.0.0.1:%d", port)
-	c.mut.Unlock()
+	c.subprocess.SetListen(port, fmt.Sprintf("http://127.0.0.1:%d", port))
 
 	if err := c.allocateProfilePort(); err != nil {
 		level.Error(c.opts.Logger).Log("msg", "failed to allocate Beyla profile port", "err", err)
-		c.reportUnhealthy(err)
+		c.health.SetUnhealthy(err)
 		c.cleanup()
-		c.scheduleRestart(restartTimer)
+		c.scheduleRestart()
 		return err
 	}
 
-	c.mut.Lock()
-	c.subprocessHealthAddr = abstractSocketAddr("health", c.opts.ID)
-	c.mut.Unlock()
+	c.subprocess.SetHealthAddr(abstractSocketAddr("health", c.opts.ID))
 
 	configPath, cleanupConfig, err := c.writeConfigFile()
 	if err != nil {
 		level.Error(c.opts.Logger).Log("msg", "failed to write config", "err", err)
-		c.reportUnhealthy(err)
+		c.health.SetUnhealthy(err)
 		c.cleanup()
-		c.scheduleRestart(restartTimer)
+		c.scheduleRestart()
 		return err
 	}
 
-	c.mut.Lock()
-	c.configPath = configPath
-	c.cleanupFuncs = append(c.cleanupFuncs, cleanupConfig)
-	c.mut.Unlock()
+	c.subprocess.SetConfig(configPath, cleanupConfig)
 
 	return nil
 }
@@ -356,45 +400,27 @@ func (c *Component) allocateProfilePort() error {
 	if err != nil {
 		return err
 	}
-	c.mut.Lock()
-	c.subprocessProfilePort = port
-	c.mut.Unlock()
+	c.subprocess.SetProfilePort(port)
 	return nil
 }
 
-func getLatestArgsFromChannel[A any](ch chan A, current A) A {
-	for {
-		select {
-		case x := <-ch:
-			current = x
-		default:
-			return current
-		}
+func (c *Component) scheduleRestart() {
+	backoff, count, ok := c.subprocess.NextBackoff()
+	if !ok {
+		level.Error(c.opts.Logger).Log("msg", "Beyla subprocess exceeded maximum restart attempts, giving up", "max_restarts", subprocess.MaxRestarts)
+		return
 	}
-}
-
-// Update implements component.Component.
-func (c *Component) Update(args component.Arguments) error {
-	c.mut.Lock()
-	defer c.mut.Unlock()
-	baseTarget, err := c.baseTarget()
-	if err != nil {
-		return err
-	}
-	c.opts.OnStateChange(Exports{
-		Targets: []discovery.Target{baseTarget},
-	})
-
-	newArgs := args.(Arguments)
-	c.argsUpdate <- newArgs
-	return nil
+	level.Info(c.opts.Logger).Log("msg", "scheduling subprocess restart", "backoff", backoff, "restart_count", count)
+	c.restartTimer.Reset(backoff)
 }
 
 func (c *Component) baseTarget() (discovery.Target, error) {
 	data, err := c.opts.GetServiceData(http_service.ServiceName)
+
 	if err != nil {
 		return discovery.EmptyTarget, fmt.Errorf("failed to get HTTP information: %w", err)
 	}
+
 	httpData := data.(http_service.Data)
 
 	return discovery.NewTargetFromMap(map[string]string{
@@ -404,82 +430,6 @@ func (c *Component) baseTarget() (discovery.Target, error) {
 		"instance":             defaultInstance(),
 		"job":                  "beyla",
 	}), nil
-}
-
-func (c *Component) reportUnhealthy(err error) {
-	c.healthMut.Lock()
-	defer c.healthMut.Unlock()
-	c.health = component.Health{
-		Health:     component.HealthTypeUnhealthy,
-		Message:    err.Error(),
-		UpdateTime: time.Now(),
-	}
-}
-
-func (c *Component) reportHealthy() {
-	c.healthMut.Lock()
-	defer c.healthMut.Unlock()
-	c.health = component.Health{
-		Health:     component.HealthTypeHealthy,
-		UpdateTime: time.Now(),
-	}
-}
-
-func (c *Component) CurrentHealth() component.Health {
-	c.healthMut.RLock()
-	defer c.healthMut.RUnlock()
-	return c.health
-}
-
-func (c *Component) Handler() http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c.mut.Lock()
-		addr := c.subprocessAddr
-		profilePort := c.subprocessProfilePort
-		ready := c.subprocessReady
-		c.mut.Unlock()
-
-		if addr == "" {
-			http.Error(w, "Beyla subprocess not started", http.StatusServiceUnavailable)
-			return
-		}
-
-		targetAddr := addr
-		if strings.HasPrefix(r.URL.Path, "/debug/pprof") {
-			if profilePort == 0 {
-				http.NotFound(w, r)
-				return
-			}
-			targetAddr = fmt.Sprintf("http://127.0.0.1:%d", profilePort)
-		}
-
-		target, err := url.Parse(targetAddr)
-		if err != nil {
-			level.Error(c.opts.Logger).Log("msg", "failed to parse subprocess URL", "err", err)
-			http.Error(w, "internal error", http.StatusInternalServerError)
-			return
-		}
-
-		proxy := httputil.NewSingleHostReverseProxy(target)
-		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-			if errors.Is(err, context.Canceled) {
-				// Client disconnected or Alloy is shutting down
-				level.Debug(c.opts.Logger).Log("msg", "proxy request cancelled", "err", err)
-				return
-			}
-			if ready {
-				level.Error(c.opts.Logger).Log("msg", "proxy error", "err", err)
-				http.Error(w, "subprocess unavailable", http.StatusBadGateway)
-			} else {
-				level.Debug(c.opts.Logger).Log("msg", "proxy error (subprocess initializing)", "err", err)
-				// Return empty 200 so scrapers don't log warnings during startup.
-				w.Header().Set("Content-Type", "text/plain; version=0.0.4")
-				w.WriteHeader(http.StatusOK)
-			}
-		}
-
-		proxy.ServeHTTP(w, r)
-	})
 }
 
 func defaultInstance() string {
@@ -496,22 +446,7 @@ func defaultInstance() string {
 
 func (c *Component) cleanup() {
 	c.stopOTLPReceiver()
-
-	c.mut.Lock()
-	defer c.mut.Unlock()
-
-	if c.beylaExeClose != nil {
-		c.beylaExeClose()
-		c.beylaExeClose = nil
-	}
-	for _, cleanupFunc := range c.cleanupFuncs {
-		cleanupFunc()
-	}
-	c.cleanupFuncs = nil
-	c.beylaExePath = ""
-	c.configPath = ""
 	c.otlpReceiverAddr = ""
-	c.subprocessProfilePort = 0
-	c.subprocessHealthAddr = ""
-	c.subprocessReady = false
+
+	c.subprocess.Reset()
 }

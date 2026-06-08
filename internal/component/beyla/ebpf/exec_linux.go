@@ -7,14 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
 	"sync/atomic"
 	"syscall"
-	"time"
 
 	"github.com/go-kit/log"
 	"golang.org/x/sys/unix"
@@ -142,12 +140,7 @@ func findFreePort() (int, error) {
 }
 
 func (c *Component) runSubprocess(ctx context.Context) error {
-	c.mut.Lock()
-	exePath := c.beylaExePath
-	configPath := c.configPath
-	port := c.subprocessPort
-	profilePort := c.subprocessProfilePort
-	c.mut.Unlock()
+	exePath, configPath, port, profilePort := c.subprocess.Launch()
 
 	if exePath == "" {
 		return fmt.Errorf("beyla executable path not set")
@@ -171,9 +164,7 @@ func (c *Component) runSubprocess(ctx context.Context) error {
 	cmd.Stdout = &logWriter{logger: c.opts.Logger, level: "info"}
 	cmd.Stderr = &logWriter{logger: c.opts.Logger, level: "error"}
 
-	c.mut.Lock()
-	c.subprocessCmd = cmd
-	c.mut.Unlock()
+	c.subprocess.SetCmd(cmd)
 
 	level.Info(c.opts.Logger).Log("msg", "starting Beyla subprocess", "binary", exePath, "port", port, "config", configPath)
 
@@ -184,7 +175,7 @@ func (c *Component) runSubprocess(ctx context.Context) error {
 	if err != nil {
 		runtime.UnlockOSThread()
 		level.Error(c.opts.Logger).Log("msg", "failed to prepare subprocess capabilities", "err", err)
-		c.reportUnhealthy(err)
+		c.health.SetUnhealthy(err)
 		return fmt.Errorf("failed to prepare subprocess capabilities: %w", err)
 	}
 
@@ -196,17 +187,12 @@ func (c *Component) runSubprocess(ctx context.Context) error {
 
 	if startErr != nil {
 		level.Error(c.opts.Logger).Log("msg", "failed to start Beyla subprocess", "err", startErr)
-		c.reportUnhealthy(startErr)
+		c.health.SetUnhealthy(startErr)
 		return fmt.Errorf("failed to start subprocess: %w", startErr)
 	}
 
 	// Child has exec'd and holds its own reference to the memfd inode; close ours now.
-	c.mut.Lock()
-	if c.beylaExeClose != nil {
-		c.beylaExeClose()
-		c.beylaExeClose = nil
-	}
-	c.mut.Unlock()
+	c.subprocess.CloseBinary()
 
 	level.Info(c.opts.Logger).Log("msg", "Beyla subprocess started", "pid", cmd.Process.Pid, "binary_size", len(beylaEmbeddedBinary))
 
@@ -214,101 +200,11 @@ func (c *Component) runSubprocess(ctx context.Context) error {
 	if err != nil && ctx.Err() == nil {
 		// Subprocess exited unexpectedly (not due to context cancellation).
 		level.Error(c.opts.Logger).Log("msg", "Beyla subprocess exited unexpectedly", "err", err)
-		c.reportUnhealthy(err)
+		c.health.SetUnhealthy(err)
 		return err
 	}
 
 	level.Info(c.opts.Logger).Log("msg", "Beyla subprocess stopped")
-	return nil
-}
-
-func (c *Component) healthCheckLoop(ctx context.Context) error {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	// Beyla loads eBPF programs before opening its Prometheus port (~15-20s).
-	select {
-	case <-ctx.Done():
-		return nil
-	case <-time.After(20 * time.Second):
-	}
-
-	consecutiveSuccesses := 0
-	consecutiveFailures := 0
-	const successesNeededToResetBackoff = 3
-	const failuresBeforeKill = 5
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-			if err := c.checkSubprocessHealth(); err != nil {
-				consecutiveFailures++
-				level.Warn(c.opts.Logger).Log("msg", "subprocess health check failed", "err", err, "consecutive_failures", consecutiveFailures)
-				c.reportUnhealthy(err)
-				consecutiveSuccesses = 0
-				if consecutiveFailures >= failuresBeforeKill {
-					return fmt.Errorf("subprocess unresponsive after %d consecutive health check failures", consecutiveFailures)
-				}
-			} else {
-				consecutiveFailures = 0
-				c.mut.Lock()
-				c.subprocessReady = true
-				c.mut.Unlock()
-				c.reportHealthy()
-				consecutiveSuccesses++
-
-				if consecutiveSuccesses >= successesNeededToResetBackoff {
-					c.mut.Lock()
-					if c.restartBackoff > 1*time.Second {
-						level.Debug(c.opts.Logger).Log("msg", "resetting restart backoff after successful health checks")
-						c.restartBackoff = 1 * time.Second
-						c.restartCount = 0
-					}
-					c.mut.Unlock()
-					consecutiveSuccesses = 0
-				}
-			}
-		}
-	}
-}
-
-func (c *Component) checkSubprocessHealth() error {
-	c.mut.Lock()
-	addr := c.subprocessHealthAddr
-	c.mut.Unlock()
-
-	if addr == "" {
-		return fmt.Errorf("subprocess not started")
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// Host is nominal — the DialContext below dials Beyla's abstract socket.
-	req, err := http.NewRequestWithContext(ctx, "GET", "http://beyla/healthz", nil)
-	if err != nil {
-		return err
-	}
-
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, "unix", addr)
-			},
-		},
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("subprocess not responding: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("subprocess returned status %d", resp.StatusCode)
-	}
 	return nil
 }
 
